@@ -1,0 +1,22 @@
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Environment variables
+.env
+
+# IDEs
+.vscode/
+
+# Project specific
+supporting_documents/
+test_output.txt
+analysis.md
+walkthrough.md.resolved

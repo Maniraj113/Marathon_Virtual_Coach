@@ -1,0 +1,12 @@
+google-adk
+google-cloud-bigquery
+google-cloud-aiplatform
+google-genai
+requests
+python-dotenv
+PyYAML
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+
