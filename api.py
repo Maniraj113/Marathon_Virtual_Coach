@@ -2,14 +2,18 @@
 FastAPI — Athlete Analyzer API
 ================================
 Endpoints:
-  POST /api/analyze  — analyze a Strava activity (primary entry point)
-  POST /api/chat     — follow-up coaching chat
-  GET  /health       — health check
+  POST /api/analyze        — analyze a Strava activity (primary entry point)
+  POST /api/chat           — follow-up coaching chat (uses existing session)
+  GET  /api/sessions/{..}  — retrieve cached analysis session for an activity
+  POST /api/sessions       — save/update analysis session with cached result
+  GET  /api/history/{..}   — list recent analysis history for an athlete
+  GET  /health             — health check
 """
 
 import os
 import logging
-from typing import Optional
+from typing import Optional, List
+from services.bq_sync import BigQuerySync
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -74,6 +78,15 @@ class ChatRequest(BaseModel):
     )
 
 
+class SaveSessionRequest(BaseModel):
+    """Request to persist an analysis session to BigQuery."""
+    strava_athlete_id: str
+    strava_activity_id: int
+    session_id: str
+    cached_analysis: str
+    activity_type: str = "training"
+
+
 class HealthResponse(BaseModel):
     status: str
     agent_name: str
@@ -98,13 +111,14 @@ app = FastAPI(
     description=(
         "AI running coach powered by Strava + BigQuery + Gemini.\n\n"
         "**Flow:**\n"
-        "1. `POST /api/analyze` — pass your Strava athlete ID + activity ID + activity type.\n"
-        "2. The system fetches your profile from BigQuery, pulls Strava streams, and streams a coaching report.\n"
-        "3. Copy the `session_id` from the response.\n"
-        "4. `POST /api/chat` — ask follow-up questions using the same session.\n\n"
+        "1. `GET /api/sessions/{athlete_id}/{activity_id}` — check for cached analysis first.\n"
+        "2. `POST /api/analyze` — only if no cached session; pass strava_athlete_id + activity_id + activity_type.\n"
+        "3. `POST /api/sessions` — save the session_id + analysis after step 2.\n"
+        "4. `POST /api/chat` — follow-up questions using the stored session_id.\n"
+        "5. `GET /api/history/{athlete_id}` — get history of all analyzed activities.\n\n"
         "**No tokens or credentials are passed from the frontend.**"
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -133,6 +147,70 @@ async def health_check():
         agent_name=getattr(engine.agent, "name", "unknown"),
         project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
+
+
+@app.get(
+    "/api/sessions/{strava_athlete_id}/{strava_activity_id}",
+    tags=["Sessions"],
+    summary="Get cached analysis session for an activity",
+)
+async def get_analysis_session(strava_athlete_id: str, strava_activity_id: int):
+    """
+    Check if a cached analysis session already exists for this athlete + activity.
+    Returns `{session_id, cached_analysis, activity_type, created_at}` or `{found: false}`.
+    """
+    from services.db_service import get_db_service
+    db = get_db_service()
+    session = db.get_analysis_session(strava_athlete_id, strava_activity_id)
+    if session:
+        logger.info(
+            f"[API/sessions] Cache HIT — athlete={strava_athlete_id} activity={strava_activity_id}"
+        )
+        return {"found": True, **session}
+    logger.info(
+        f"[API/sessions] Cache MISS — athlete={strava_athlete_id} activity={strava_activity_id}"
+    )
+    return {"found": False}
+
+
+@app.post(
+    "/api/sessions",
+    tags=["Sessions"],
+    summary="Save analysis session to BigQuery",
+)
+async def save_analysis_session(request: SaveSessionRequest):
+    """
+    Persist the session_id and cached analysis result for this athlete + activity.
+    Call this after a successful /api/analyze to avoid re-analysis on next open.
+    """
+    from services.db_service import get_db_service
+    db = get_db_service()
+    ok = db.save_analysis_session(
+        strava_athlete_id=request.strava_athlete_id,
+        strava_activity_id=request.strava_activity_id,
+        session_id=request.session_id,
+        cached_analysis=request.cached_analysis,
+        activity_type=request.activity_type,
+    )
+    if ok:
+        return {"status": "saved"}
+    raise HTTPException(status_code=500, detail="Failed to save session to BigQuery.")
+
+
+@app.get(
+    "/api/history/{strava_athlete_id}",
+    tags=["Sessions"],
+    summary="List recent analysis history for an athlete",
+)
+async def get_analysis_history(strava_athlete_id: str, limit: int = 20):
+    """
+    Returns a list of recent analyses for the sidebar history panel.
+    Each entry: {session_id, strava_activity_id, activity_type, created_at}.
+    """
+    from services.db_service import get_db_service
+    db = get_db_service()
+    history = db.list_analysis_sessions(strava_athlete_id, limit=limit)
+    return {"history": history}
 
 
 @app.post(
@@ -189,6 +267,7 @@ async def chat(request: ChatRequest):
     """
     Continue coaching conversation from a previous /api/analyze session.
     Pass the session_id returned from /api/analyze to maintain context.
+    The agent loads the previous activity from session state — no re-analysis.
 
     Returns a stream of ndjson objects:
       `{"text": "...", "session_id": "..."}` — coaching response chunks
@@ -203,10 +282,12 @@ async def chat(request: ChatRequest):
 
     async def event_generator():
         try:
+            # Note: activity_id=None signals a follow-up chat, not a new analysis
             async for chunk in engine.chat_async(
                 message=request.message,
                 user_id=request.user_id,
                 session_id=request.session_id,
+                activity_id=None,   # ← crucial: tells pipeline NOT to re-fetch Strava data
             ):
                 yield json.dumps(chunk) + "\n"
         except Exception as e:
@@ -214,3 +295,38 @@ async def chat(request: ChatRequest):
             yield json.dumps({"error": str(e)}) + "\n"
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
+@app.post(
+    "/api/sync",
+    tags=["Database Sync"],
+    summary="Trigger BigQuery sync from PostgreSQL",
+    response_description="Sync status",
+)
+async def sync_data():
+    """
+    Trigger a full sync of all athlete-related tables from the Supabase PostgreSQL
+    database to Google BigQuery.
+    
+    This endpoint is intended to be called by Cloud Scheduler on a daily basis.
+    """
+    try:
+        tables = [
+            "athletes", 
+            "activities", 
+            "race_results", 
+            "personal_details", 
+            "coach_session_logs", 
+            "meal_logs", 
+            "wellness_logs",
+            "challenge_activities", 
+            "challenge_participants"
+        ]
+        
+        sync_manager = BigQuerySync()
+        sync_manager.run_full_sync(tables)
+        
+        return {"status": "success", "message": "All tables synced successfully to BigQuery."}
+    except Exception as e:
+        logger.error(f"Sync failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")

@@ -53,6 +53,72 @@ with open(_PROMPTS_PATH, "r") as f:
 
 
 # ── Pipeline State ────────────────────────────────────────────────────────────
+# ── Shared GenAI Client (Reused for Performance) ──────────────────────────────
+_genai_client = genai.Client(vertexai=True, project=_project_id, location=_location)
+
+async def _stream_specialist(system_instruction: str, user_message: str, label: str = "LLM") -> AsyncGenerator[str, None]:
+    """
+    CoachAgent — Streams Gemini response via Vertex AI.
+    Yields chunks as they arrive.
+    """
+    logger.info(f"[Streaming:{label}] Starting stream for model={_model_name}")
+    
+    # Use the shared client's .aio interface
+    try:
+        t0 = time.perf_counter()
+        stream = await _genai_client.aio.models.generate_content_stream(
+            model=_model_name,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction
+            )
+        )
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
+        
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        
+        # Log telemetry after stream completes
+        try:
+            usage = getattr(stream, "usage_metadata", None)
+            if usage:
+                logger.info(
+                    f"[Telemetry:{label}/Stream] model={_model_name} "
+                    f"| latency={latency_ms}ms "
+                    f"| prompt_tokens={usage.prompt_token_count} "
+                    f"| candidate_tokens={usage.candidates_token_count}"
+                )
+        except Exception:
+            pass
+            
+    except Exception as e:
+        logger.error(f"[Streaming:{label}] Error during stream: {e}", exc_info=True)
+        yield " [AI Agent Error: Stream interrupted] "
+
+
+def _call_specialist(system_instruction: str, user_message: str, label: str = "LLM") -> str:
+    """
+    CoachAgent — calls Gemini via Vertex AI (Sync/One-shot).
+    Used when we don't need streaming (unlikely in this chat).
+    """
+    t0 = time.perf_counter()
+    response = _genai_client.models.generate_content(
+        model=_model_name,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction
+        )
+    )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        logger.info(f"[Telemetry:{label}] model={_model_name} | latency={latency_ms}ms | tokens={usage.total_token_count}")
+
+    return response.text
+
+
 class AthleteState(BaseModel):
     """Structured state passed between pipeline stages."""
     user_id:        str = ""
@@ -64,37 +130,7 @@ class AthleteState(BaseModel):
 
 
 # ── LLM Specialist Caller with Telemetry ─────────────────────────────────────
-def _call_specialist(system_instruction: str, user_message: str, label: str = "LLM") -> str:
-    """
-    CoachAgent — calls Gemini via Vertex AI.
-    Logs prompt tokens, candidate tokens, total tokens, and latency.
-    """
-    client = genai.Client(vertexai=True, project=_project_id, location=_location)
-    
-    t0 = time.perf_counter()
-    response = client.models.generate_content(
-        model=_model_name,
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction
-        )
-    )
-    latency_ms = int((time.perf_counter() - t0) * 1000)
-
-    # Token telemetry
-    usage = getattr(response, "usage_metadata", None)
-    if usage:
-        prompt_t    = getattr(usage, "prompt_token_count", "n/a")
-        candidate_t = getattr(usage, "candidates_token_count", "n/a")
-        total_t     = getattr(usage, "total_token_count", "n/a")
-        logger.info(
-            f"[Telemetry:{label}] model={_model_name} | latency={latency_ms}ms "
-            f"| prompt_tokens={prompt_t} | candidate_tokens={candidate_t} | total_tokens={total_t}"
-        )
-    else:
-        logger.info(f"[Telemetry:{label}] model={_model_name} | latency={latency_ms}ms | usage_metadata=unavailable")
-
-    return response.text
+# The original _call_specialist function was here. It has been moved and modified above.
 
 
 def _extract_json(raw: str) -> Dict[str, Any]:
@@ -241,15 +277,13 @@ class CoachingPipeline(BaseAgent):
                 None, _build_analyst_prompt, analysis_data, activity_type
             )
 
-            coaching_report = await loop.run_in_executor(
-                None,
-                lambda: _call_specialist(
-                    PROMPTS["activity_analyst"]["instruction"],
-                    analyst_prompt,
-                    label="CoachAgent/Analyze",
-                ),
-            )
-            yield coaching_report
+            # Stream the coaching report directly for better UX
+            async for chunk in _stream_specialist(
+                PROMPTS["activity_analyst"]["instruction"],
+                analyst_prompt,
+                label="CoachAgent/Analyze",
+            ):
+                yield chunk
             return
 
         # ── B: Follow-up Chat ─────────────────────────────────────────────────
@@ -283,15 +317,13 @@ class CoachingPipeline(BaseAgent):
             return
 
        
-        final_resp = await loop.run_in_executor(
-            None,
-            lambda: _call_specialist(
-                PROMPTS["general_coach"]["instruction"],
-                enriched_message,
-                label="CoachAgent/Chat",
-            ),
-        )
-        yield final_resp
+        # Route to general coach
+        async for chunk in _stream_specialist(
+            PROMPTS["general_coach"]["instruction"],
+            enriched_message,
+            label="CoachAgent/Chat",
+        ):
+            yield chunk
 
 
 # ── Coaching Engine — Session Management ──────────────────────────────────────
@@ -367,7 +399,9 @@ class CoachingEngine:
             raise ValueError("user_id (strava_athlete_id) is required.")
 
         t_start = time.time()
+        t_init = time.time()
         session_id = await self._get_or_create_session(user_id, session_id)
+        logger.info(f"[Perf] Session resolution took: {time.time() - t_init:.2f}s")
         
         loop = asyncio.get_event_loop()
         analysis_data = None
@@ -377,11 +411,13 @@ class CoachingEngine:
         if activity_id is not None:
             yield {"text": " Looking up your athlete profile...", "session_id": session_id}
             
+            t_bq = time.time()
             from services.db_service import get_db_service
             db = get_db_service()
 
             logger.info(f"[Stage0/DataFetcher] BigQuery lookup for strava_id={user_id}")
             profile = db.get_athlete_profile_by_strava_id(user_id)
+            logger.info(f"[Perf] BQ profile fetch took: {time.time() - t_bq:.2f}s")
 
             if not profile:
                 yield {"text": f"\n\n Athlete with Strava ID `{user_id}` not found in the database. Please check the ID.", "session_id": session_id}
@@ -398,6 +434,7 @@ class CoachingEngine:
 
             yield {"text": f"\n\n📡 Connecting to Strava to fetch activity {activity_id}...", "session_id": session_id}
             
+            t_strava = time.time()
             from tools.coach_tools import analyze_activity_deep
             analysis_data = await loop.run_in_executor(
                 None,
@@ -406,6 +443,7 @@ class CoachingEngine:
                 refresh_token,
                 athlete_name,
             )
+            logger.info(f"[Perf] Strava fetch took: {time.time() - t_strava:.2f}s")
 
             if "error" in analysis_data:
                 yield {"text": f"\n\n {analysis_data['error']}", "session_id": session_id}
@@ -441,7 +479,7 @@ class CoachingEngine:
 
         t_end = time.time()
         total_time = t_end - t_start
-        yield {"text": f"\n\n⏱️ Total processing time: {total_time:.2f} seconds.", "session_id": session_id}
+        yield {"text": f"\n\n Total processing time: {total_time:.2f} seconds.", "session_id": session_id}
 
     @property
     def agent(self):
