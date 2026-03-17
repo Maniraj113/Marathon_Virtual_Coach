@@ -10,3 +10,6 @@ uvicorn
 pydantic
 pydantic-settings
 psycopg2-binary
+mcp
+httpx
+redis

@@ -16,9 +16,18 @@ Data flow:
 
 import logging
 import json
-import requests
+import httpx
 import statistics
+import os
+import redis
 from typing import Dict, Any, List
+
+# Initialize Redis client (fallback to None if unavailable)
+try:
+    redis_client = redis.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", 6379)), db=0, decode_responses=True)
+except Exception as e:
+    redis_client = None
+
 
 from services.strava_service import StravaService
 
@@ -35,6 +44,14 @@ def _fmt_pace(moving_time_s: float, distance_m: float) -> str:
     mins = int(pace_min_km)
     secs = int((pace_min_km - mins) * 60)
     return f"{mins}:{secs:02d}"
+
+
+def _fmt_speed(moving_time_s: float, distance_m: float) -> str:
+    """Convert (seconds, metres) → speed string 'XX.X km/h'."""
+    if not moving_time_s or moving_time_s == 0:
+        return "0.0 km/h"
+    speed_km_h = (distance_m / 1000) / (moving_time_s / 3600)
+    return f"{speed_km_h:.1f} km/h"
 
 
 def _fmt_time(seconds: float) -> str:
@@ -54,7 +71,7 @@ def _fmt_elev(diff: float) -> str:
 
 # ── Main Tool ─────────────────────────────────────────────────────────────────
 
-def analyze_activity_deep(
+async def analyze_activity_deep(
     activity_id: int,
     refresh_token: str,
     athlete_name: str,
@@ -75,18 +92,34 @@ def analyze_activity_deep(
         logger.error("[DataFetcher] No refresh token — cannot authenticate")
         return {"error": "Strava refresh token not provided."}
 
+    # ── Cache Check ───────────────────────────────────────────────────────────
+    cache_key = f"strava:{activity_id}"
+    if redis_client:
+        try:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                logger.info(f"[DataFetcher] Cache HIT for {cache_key}")
+                return json.loads(cached_data)
+        except Exception as e:
+            logger.warning(f"[DataFetcher] Redis get failed: {e}")
+
     # ── Auth ──────────────────────────────────────────────────────────────────
     strava = StravaService(refresh_token=refresh_token)
-    if not strava.refresh_access_token():
+    
+    # We run the blocking auth token refresh in a thread to keep the event loop free
+    import asyncio
+    success = await asyncio.to_thread(strava.refresh_access_token)
+    if not success:
         return {"error": "Strava authentication failed. Check refresh token."}
 
     headers = {"Authorization": f"Bearer {strava.access_token}"}
 
     # ── Fetch raw activity details ────────────────────────────────────────────
-    resp = requests.get(
-        f"https://www.strava.com/api/v3/activities/{activity_id}",
-        headers=headers,
-    )
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://www.strava.com/api/v3/activities/{activity_id}",
+            headers=headers,
+        )
     if resp.status_code != 200:
         return {"error": f"Strava activity fetch failed: HTTP {resp.status_code} — {resp.text[:200]}"}
 
@@ -106,21 +139,25 @@ def analyze_activity_deep(
     logger.info(f"  splits count: {len(raw_details.get('splits_metric', []))}")
     logger.info("=" * 60)
 
+    # Strava activity type (e.g., Run, Ride, Yoga, WeightTraining, Walk)
+    activity_type = raw_details.get("type", "Run")
+    is_run_or_walk = activity_type in ["Run", "Walk", "Hike"]
+
     # ── Clean Laps ────────────────────────────────────────────────────────────
-    # Matches Strava's own lap table: Lap | Distance | Time | Pace | Elev | HR
+    # Matches Strava's own lap table: Lap | Distance | Time | Pace/Speed | Elev | HR
     raw_laps = raw_details.get("laps", [])
     cleaned_laps = []
     for lap in raw_laps:
         dist_m = lap.get("distance", 0)
         mov_t  = lap.get("moving_time", 0)
         hr_val = lap.get("average_heartrate")
-        elev_diff = lap.get("elevation_difference", 0)   # signed ± value
+        elev_diff = lap.get("elevation_difference", 0)
 
         cleaned_laps.append({
             "lap":      lap.get("lap_index"),
             "distance": f"{dist_m/1000:.2f} km",
             "time":     _fmt_time(mov_t),
-            "pace":     _fmt_pace(mov_t, dist_m),
+            "pace":     _fmt_pace(mov_t, dist_m) if is_run_or_walk else _fmt_speed(mov_t, dist_m),
             "elev":     _fmt_elev(elev_diff),
             "hr":       f"{round(hr_val)} bpm" if hr_val else "N/A",
         })
@@ -136,7 +173,7 @@ def analyze_activity_deep(
         cleaned_splits.append({
             "km":   s.get("split"),
             "time": _fmt_time(mov_t),
-            "pace": _fmt_pace(mov_t, dist_m),
+            "pace": _fmt_pace(mov_t, dist_m) if is_run_or_walk else _fmt_speed(mov_t, dist_m),
             "hr":   f"{round(hr_val)} bpm" if hr_val else "N/A",
             "elev": _fmt_elev(elev_diff),
         })
@@ -152,7 +189,7 @@ def analyze_activity_deep(
     # ── Overall Stats ─────────────────────────────────────────────────────────
     total_dist_km = round(raw_details.get("distance", 0) / 1000, 2)
     moving_secs   = raw_details.get("moving_time", 0)
-    overall_pace  = _fmt_pace(moving_secs, raw_details.get("distance", 0))
+    overall_pace  = _fmt_pace(moving_secs, raw_details.get("distance", 0)) if is_run_or_walk else _fmt_speed(moving_secs, raw_details.get("distance", 0))
 
     # ── Build clean payload ───────────────────────────────────────────────────
     clean_payload = {
@@ -160,6 +197,7 @@ def analyze_activity_deep(
         "activity_id":        activity_id,
         "activity_name":      raw_details.get("name", "Run"),
         "activity_type":      raw_details.get("type", "Run"),
+        "activity_date":      raw_details.get("start_date"),
         "has_heartrate":      has_hr,
         "description":        raw_details.get("description") or "None",
         "total_distance_km":  total_dist_km,
@@ -182,8 +220,17 @@ def analyze_activity_deep(
     logger.info(f"  avg_pace      : {clean_payload['avg_pace_overall']}/km")
     logger.info(f"  avg_hr        : {clean_payload['avg_hr']}")
     logger.info(f"  max_hr        : {clean_payload['max_hr']}")
+    logger.info(f"  elevation     : {clean_payload['total_elevation_m']} m")
     logger.info(f"  laps count    : {len(cleaned_laps)}")
     logger.info(f"  splits count  : {len(cleaned_splits)}")
     logger.info("=" * 60)
+
+    # ── Cache the result ──────────────────────────────────────────────────────
+    if redis_client and "error" not in clean_payload:
+        try:
+            redis_client.setex(cache_key, 1800, json.dumps(clean_payload))
+            logger.info(f"[DataFetcher] Cached payload for {cache_key}")
+        except Exception as e:
+            logger.warning(f"[DataFetcher] Redis set failed: {e}")
 
     return clean_payload

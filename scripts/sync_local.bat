@@ -5,6 +5,7 @@ echo.
 echo 🔄 Starting Manual Database Sync (Postgres -> BigQuery)...
 echo.
 
+cd ..
 :: Run the sync script directly
 python services/bq_sync.py
 

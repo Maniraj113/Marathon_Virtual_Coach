@@ -5,6 +5,7 @@ echo.
 echo  Starting Athlete Analyzer Local Server...
 echo.
 
+cd ..
 :: Check for .env file
 if not exist .env (
     echo  .env file not found! Please create it based on your db details.
@@ -13,8 +14,8 @@ if not exist .env (
 
 
 :: Start FastAPI with Uvicorn
-echo  Launching API at http://localhost:8000
-echo  Documentation available at http://localhost:8000/docs
+echo  Launching API at http://localhost:8001
+echo  Documentation available at http://localhost:8001/docs
 echo.
 uvicorn api:app --reload --host 0.0.0.0 --port 8001
 

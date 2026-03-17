@@ -19,9 +19,10 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel, Field
 import json
+from services.db_service import get_db_service
 
 load_dotenv()
 logging.basicConfig(
@@ -40,14 +41,14 @@ class AnalyzeRequest(BaseModel):
         description="Strava athlete ID (used as user_id for session management).",
         json_schema_extra={"example": "12345678"},
     )
-    strava_activity_id: int = Field(
-        ...,
-        description="Strava activity ID to analyze.",
+    strava_activity_id: Optional[int] = Field(
+        default=None,
+        description="Strava activity ID to analyze. Leave empty for general fitness questions.",
         json_schema_extra={"example": 16929808992},
     )
     activity_type: str = Field(
         default="training",
-        description="Session type: 'training' or 'race'. Affects coaching tone.",
+        description="Session type: 'training', 'race', 'Easy Run', 'Interval Run', 'Tempo Run', 'Long Run', 'Normal Run', 'Workout'. Affects coaching tone and focus.",
         json_schema_extra={"example": "training"},
     )
     message: Optional[str] = Field(
@@ -58,6 +59,14 @@ class AnalyzeRequest(BaseModel):
         default=None,
         description="Existing session ID to continue. Leave empty for a new session.",
     )
+
+
+class ProfileRequest(BaseModel):
+    """Profile update details."""
+    age: Optional[int] = None
+    yearly_goal: Optional[str] = None
+    activity_preference: Optional[str] = None
+
 
 
 class ChatRequest(BaseModel):
@@ -85,6 +94,8 @@ class SaveSessionRequest(BaseModel):
     session_id: str
     cached_analysis: str
     activity_type: str = "training"
+    activity_name: str = "Activity"
+    activity_date: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -97,7 +108,7 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from coach_agent import coaching_engine
+    from agents.coach_agent import coaching_engine
     app.state.engine = coaching_engine
     logger.info("🏃 Coaching Engine initialized.")
     yield
@@ -107,9 +118,9 @@ async def lifespan(app: FastAPI):
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="🏃 Athlete Analyzer — Coach Miles API",
+    title="🏃 Athlete Analyzer — Agent API",
     description=(
-        "AI running coach powered by Strava + BigQuery + Gemini.\n\n"
+        "AI running coach powered by Vertex AI Strava + BigQuery + Gemini.\n\n"
         "**Flow:**\n"
         "1. `GET /api/sessions/{athlete_id}/{activity_id}` — check for cached analysis first.\n"
         "2. `POST /api/analyze` — only if no cached session; pass strava_athlete_id + activity_id + activity_type.\n"
@@ -135,7 +146,6 @@ app.add_middleware(
 
 @app.get("/", tags=["Health"])
 async def root():
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/docs")
 
 
@@ -144,7 +154,7 @@ async def health_check():
     engine = app.state.engine
     return HealthResponse(
         status="healthy",
-        agent_name=getattr(engine.agent, "name", "unknown"),
+        agent_name=getattr(engine.pipeline, "name", "unknown"),
         project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
 
@@ -157,9 +167,8 @@ async def health_check():
 async def get_analysis_session(strava_athlete_id: str, strava_activity_id: int):
     """
     Check if a cached analysis session already exists for this athlete + activity.
-    Returns `{session_id, cached_analysis, activity_type, created_at}` or `{found: false}`.
+    Returns `{session_id, cached_analysis, activity_type, created_at, activity_name, activity_date}` or `{found: false}`.
     """
-    from services.db_service import get_db_service
     db = get_db_service()
     session = db.get_analysis_session(strava_athlete_id, strava_activity_id)
     if session:
@@ -183,7 +192,6 @@ async def save_analysis_session(request: SaveSessionRequest):
     Persist the session_id and cached analysis result for this athlete + activity.
     Call this after a successful /api/analyze to avoid re-analysis on next open.
     """
-    from services.db_service import get_db_service
     db = get_db_service()
     ok = db.save_analysis_session(
         strava_athlete_id=request.strava_athlete_id,
@@ -191,6 +199,8 @@ async def save_analysis_session(request: SaveSessionRequest):
         session_id=request.session_id,
         cached_analysis=request.cached_analysis,
         activity_type=request.activity_type,
+        activity_name=request.activity_name,
+        activity_date=request.activity_date,
     )
     if ok:
         return {"status": "saved"}
@@ -202,15 +212,75 @@ async def save_analysis_session(request: SaveSessionRequest):
     tags=["Sessions"],
     summary="List recent analysis history for an athlete",
 )
-async def get_analysis_history(strava_athlete_id: str, limit: int = 20):
+async def get_analysis_history(strava_athlete_id: str, limit: int = 50):
     """
     Returns a list of recent analyses for the sidebar history panel.
-    Each entry: {session_id, strava_activity_id, activity_type, created_at}.
+    Each entry: {session_id, strava_activity_id, activity_type, created_at, activity_name, activity_date}.
     """
-    from services.db_service import get_db_service
     db = get_db_service()
     history = db.list_analysis_sessions(strava_athlete_id, limit=limit)
     return {"history": history}
+
+
+@app.get(
+    "/api/profile/{strava_athlete_id}",
+    tags=["Profile"],
+    summary="Get athlete profile",
+)
+async def get_profile(strava_athlete_id: str):
+    db = get_db_service()
+    # It might take a moment to sync from PG to BQ, but normally the cached read is fast
+    profile = db.get_athlete_profile_by_strava_id(strava_athlete_id)
+    if profile:
+        return {
+            "age": profile.get("age"),
+            "yearly_goal": profile.get("yearly_goal"),
+            "activity_preference": profile.get("activity_preference"),
+            "profile_completed": profile.get("profile_completed", False),
+        }
+    raise HTTPException(status_code=404, detail="Profile not found")
+
+
+@app.post(
+    "/api/profile/{strava_athlete_id}",
+    tags=["Profile"],
+    summary="Update athlete profile",
+)
+async def update_profile(strava_athlete_id: str, request: ProfileRequest):
+    db = get_db_service()
+    
+    try:
+        success = await db.update_athlete_profile(
+            strava_athlete_id, 
+            request.age, 
+            request.yearly_goal, 
+            request.activity_preference
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Athlete not found")
+            
+        return {"status": "success", "profile_completed": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update profile: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get(
+    "/api/chat/history/{session_id}",
+    tags=["Coaching"],
+    summary="Get full message history for a session",
+)
+async def get_chat_history(session_id: str):
+    """
+    Returns all user and model messages for a specific session.
+    Used to reconstruct the chat UI when viewing past history.
+    """
+    db = get_db_service()
+    messages = db.list_chat_messages(session_id)
+    return {"session_id": session_id, "messages": messages}
 
 
 @app.post(

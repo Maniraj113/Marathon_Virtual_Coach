@@ -4,6 +4,7 @@ echo    Git Push Script - Athlete Analyzer
 echo =======================================
 echo.
 
+cd ..
 :: Stage all changes
 echo Staging all changes...
 git add .
