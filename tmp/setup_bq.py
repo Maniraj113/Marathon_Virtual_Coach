@@ -6,7 +6,7 @@ load_dotenv()
 
 def setup_table():
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "athlete-analyzer-479515")
-    dataset_id = "athlete_analysis"
+    dataset_id = "athlete_analysis_us"
     table_id = "coach_analysis_sessions"
     
     client = bigquery.Client(project=project_id)

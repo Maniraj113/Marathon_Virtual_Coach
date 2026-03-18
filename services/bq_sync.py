@@ -18,7 +18,7 @@ class BigQuerySync:
     def __init__(self):
         self.db_url = os.getenv("DATABASE_URL")
         self.project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
-        self.dataset_id = os.getenv("BIGQUERY_DATASET", "athlete_analysis")
+        self.dataset_id = os.getenv("BIGQUERY_DATASET", "athlete_analysis_us")
         
         if not self.db_url:
             raise ValueError("DATABASE_URL environment variable is not set")

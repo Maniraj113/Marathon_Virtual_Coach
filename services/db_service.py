@@ -28,7 +28,7 @@ class DatabaseService:
         Initialize BigQuery service.
         """
         self.project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
-        self.dataset_id = "athlete_analysis"
+        self.dataset_id = "athlete_analysis_us"
         self.table_name = "activities"
         self.sessions_table = "coach_analysis_sessions"
         self.chat_table = "coach_chat_history"

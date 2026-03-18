@@ -75,7 +75,9 @@ async def _stream_specialist(system_instruction: str, user_message: Any, label: 
                 system_instruction=system_instruction
             )
         )
+        last_chunk = None
         async for chunk in stream:
+            last_chunk = chunk
             if chunk.text:
                 yield {"text": chunk.text}
         
@@ -83,7 +85,7 @@ async def _stream_specialist(system_instruction: str, user_message: Any, label: 
         
         # Log telemetry after stream completes
         try:
-            usage = getattr(stream, "usage_metadata", None)
+            usage = getattr(last_chunk, "usage_metadata", None)
             if usage:
                 logger.info(
                     f"[Telemetry:{label}/Stream] model={_model_name} "
@@ -99,8 +101,8 @@ async def _stream_specialist(system_instruction: str, user_message: Any, label: 
                     "stream_latency_ms": latency_ms
                 }
                 yield {"text": f"\n\n<!--TELEMETRY:{json.dumps(metrics)}-->"}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[Telemetry] Exception getting usage: {e}")
             
     except Exception as e:
         logger.error(f"[Streaming:{label}] Error during stream: {e}", exc_info=True)
